@@ -4,12 +4,7 @@ Upload a Root PPTX and a Template PPTX, merge them, download the result.
 """
 
 import streamlit as st
-from merger import (
-    merge_presentations,
-    get_template_layout_names,
-    get_root_slide_previews,
-    suggest_layout_map,
-)
+from merger import merge_presentations
 
 # ─── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -199,77 +194,13 @@ with col2:
 
 st.markdown("<hr>", unsafe_allow_html=True)
 
-# ─── Read files once (getvalue → non-consuming, safe across reruns) ───────────
-root_bytes     = root_file.getvalue() if root_file else None
-template_bytes = template_file.getvalue() if template_file else None
-
-# ─── Layout mapping ──────────────────────────────────────────────────────────
-layout_map = None
-if root_bytes and template_bytes:
-    try:
-        layout_names = get_template_layout_names(template_bytes)
-        previews     = get_root_slide_previews(root_bytes)
-        suggestions  = suggest_layout_map(root_bytes, template_bytes)
-    except Exception as e:
-        st.error(f"❌ Couldn't read the uploaded files: {e}")
-        layout_names = previews = suggestions = None
-
-    if layout_names and previews:
-        st.markdown(
-            f'<div class="card-label">Layout Mapping</div>'
-            f'<div class="card-desc">Template has <b>{len(layout_names)}</b> layout(s) · '
-            f'Root has <b>{len(previews)}</b> slide(s). Choose how content lands on the design.</div>',
-            unsafe_allow_html=True,
-        )
-
-        mode = st.radio(
-            "Layout mode",
-            ["Auto-match (recommended)", "One layout for every slide", "Pick per slide"],
-            key="layout_mode",
-            label_visibility="collapsed",
-        )
-
-        def _fmt(i):
-            return f"{i}. {layout_names[i]}"
-
-        if mode == "Auto-match (recommended)":
-            layout_map = None  # engine best-matches each slide
-
-        elif mode == "One layout for every slide":
-            gi = st.selectbox(
-                "Layout to apply to all slides",
-                options=list(range(len(layout_names))),
-                format_func=_fmt,
-                key="global_layout",
-            )
-            layout_map = [gi] * len(previews)
-
-        else:  # Pick per slide
-            st.caption("Defaults below are the auto-matched layout — change any you like.")
-            layout_map = []
-            with st.expander(f"Per-slide layouts ({len(previews)} slides)", expanded=True):
-                for i, pv in enumerate(previews):
-                    default = suggestions[i] if i < len(suggestions) else 0
-                    if not (0 <= default < len(layout_names)):
-                        default = 0
-                    sel = st.selectbox(
-                        f"Slide {i + 1} — {pv['text']}",
-                        options=list(range(len(layout_names))),
-                        format_func=_fmt,
-                        index=default,
-                        key=f"layout_{i}",
-                    )
-                    layout_map.append(sel)
-
-        st.markdown("<hr>", unsafe_allow_html=True)
-
 # ─── Merge button ────────────────────────────────────────────────────────────
-if st.button("✨  Merge Slides", disabled=not (root_bytes and template_bytes)):
+if st.button("✨  Merge Slides", disabled=not (root_file and template_file)):
     with st.spinner("Merging presentations... this may take a few seconds."):
         try:
-            output_bytes, warnings = merge_presentations(
-                root_bytes, template_bytes, layout_map
-            )
+            root_bytes     = root_file.read()
+            template_bytes = template_file.read()
+            output_bytes, warnings = merge_presentations(root_bytes, template_bytes)
 
             st.session_state["output_bytes"] = output_bytes
             st.session_state["warnings"]     = warnings
