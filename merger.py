@@ -510,6 +510,101 @@ def _clone_shape_xml(new_slide, shape, new_id):
     new_slide.shapes._spTree.append(el)
 
 
+# ── "Today we will learn to" styled slide ───────────────────────────────────
+# The SEJ template renders this slide as a centred brown header plus one
+# icon-and-text row per learning objective. The root file only has a plain
+# text box, so we rebuild the styled layout using the template's own icon.
+
+_LT_HEADER      = "Today we will learn to"
+_LT_HDR_FONT    = "Anek Bangla"
+_LT_HDR_SIZE    = 381_000                    # 30 pt
+_LT_HDR_COLOR   = RGBColor(0x78, 0x3F, 0x04)  # template brown
+_LT_HDR_BOX     = (2_559_775, 134_213, 4_024_500, 603_000)  # L, T, W, H
+
+_LT_BODY_FONT   = "Anek Bangla"
+_LT_BODY_SIZE   = 292_100                    # 23 pt
+_LT_BODY_COLOR  = RGBColor(0x00, 0x00, 0x00)
+_LT_ROW_TOP     = 1_231_875
+_LT_ROW_STEP    = 875_350
+_LT_ICON_X      = 1_120_650
+_LT_ICON_W      = 630_950
+_LT_ICON_H      = 553_639
+_LT_ICON_DY     = 24_675                     # icon sits slightly below the text top
+_LT_TEXT_X      = 1_850_600
+_LT_TEXT_W      = 6_418_200
+_LT_TEXT_H      = 603_000
+
+
+def _is_learn_today(root_slide):
+    """True if this root slide is the 'Today we will learn to' objectives slide."""
+    for s in root_slide.shapes:
+        if s.has_text_frame:
+            head = s.text_frame.text.strip().lower()
+            if head.startswith("today we will learn"):
+                return True
+    return False
+
+
+def _learn_today_objectives(root_slide):
+    """Objective lines from the root slide (everything after the title line)."""
+    items = []
+    for s in root_slide.shapes:
+        if not s.has_text_frame:
+            continue
+        for p in s.text_frame.paragraphs:
+            line = p.text.strip()
+            if not line or line.lower().startswith("today we will learn"):
+                continue
+            items.append(line)
+    return items
+
+
+def _extract_learn_today_icon(prs_design):
+    """Return the objective-row icon image blob from the template, or None."""
+    for slide in prs_design.slides:
+        if not _is_learn_today(slide):
+            continue
+        for s in slide.shapes:               # find the icon inside a group row
+            if s.shape_type == 6:            # GROUP
+                for child in s.shapes:
+                    if child.shape_type == 13:  # PICTURE
+                        try:
+                            return child.image.blob
+                        except Exception:
+                            pass
+    return None
+
+
+def _build_learn_today(new_slide, objectives, icon_blob):
+    """Rebuild the styled 'Today we will learn to' slide with objective rows."""
+    # Header
+    hb = new_slide.shapes.add_textbox(*_LT_HDR_BOX)
+    tf = hb.text_frame
+    tf.clear(); tf.word_wrap = True
+    p = tf.paragraphs[0]; p.alignment = PP_ALIGN.CENTER
+    run = p.add_run(); run.text = _LT_HEADER
+    run.font.name = _LT_HDR_FONT; run.font.size = _LT_HDR_SIZE
+    run.font.bold = True; run.font.color.rgb = _LT_HDR_COLOR
+
+    # One icon + text row per objective
+    for i, text in enumerate(objectives):
+        row_top = _LT_ROW_TOP + i * _LT_ROW_STEP
+        if icon_blob:
+            try:
+                new_slide.shapes.add_picture(
+                    io.BytesIO(icon_blob), _LT_ICON_X, row_top + _LT_ICON_DY,
+                    _LT_ICON_W, _LT_ICON_H)
+            except Exception:
+                pass
+        tb = new_slide.shapes.add_textbox(_LT_TEXT_X, row_top, _LT_TEXT_W, _LT_TEXT_H)
+        bf = tb.text_frame
+        bf.clear(); bf.word_wrap = True
+        bp = bf.paragraphs[0]; bp.alignment = PP_ALIGN.LEFT
+        brun = bp.add_run(); brun.text = text
+        brun.font.name = _LT_BODY_FONT; brun.font.size = _LT_BODY_SIZE
+        brun.font.color.rgb = _LT_BODY_COLOR
+
+
 def merge_sej(root_bytes: bytes, template_bytes: bytes) -> bytes:
     """
     Merge an SEJ Root file's content onto the SEJ Intermediate Template design.
@@ -545,11 +640,25 @@ def merge_sej(root_bytes: bytes, template_bytes: bytes) -> bytes:
     title_layout   = layouts[1] if len(layouts) > 1 else layouts[0]
     content_layout = layouts[2] if len(layouts) > 2 else title_layout
 
+    # Read the template's own design (unwiped copy) for the styled
+    # "Today we will learn to" objective icon.
+    prs_design = Presentation(io.BytesIO(template_bytes))
+    learn_today_icon = _extract_learn_today_icon(prs_design)
+
     warnings = []
 
     for slide_idx, root_slide in enumerate(prs_root.slides):
         layout = title_layout if slide_idx == 0 else content_layout
         new_slide = prs_styled.slides.add_slide(layout)
+
+        # Rebuild the "Today we will learn to" slide in the template's style.
+        if slide_idx != 0 and _is_learn_today(root_slide):
+            try:
+                _build_learn_today(
+                    new_slide, _learn_today_objectives(root_slide), learn_today_icon)
+                continue
+            except Exception as e:
+                warnings.append(f"Slide {slide_idx+1} | learn-today: {e}")
 
         # Copy shapes in document order so z-ordering is preserved.
         for shape in root_slide.shapes:
