@@ -4,7 +4,13 @@ Upload a Root PPTX and a Template PPTX, merge them, download the result.
 """
 
 import streamlit as st
-from merger import merge_presentations
+from merger import merge_presentations, merge_sej
+
+# Merge function used for each program option.
+MERGE_FUNCS = {
+    "IELTS": merge_presentations,
+    "SEJ":   merge_sej,
+}
 
 # ─── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -152,11 +158,23 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+# ─── Program selector ────────────────────────────────────────────────────────
+program = st.radio(
+    "Choose a program",
+    ["IELTS", "SEJ"],
+    horizontal=True,
+    help="Pick the program the files belong to — each uses its own merge rules. "
+         "IELTS applies the IELTS template logic; SEJ applies the Spoken English "
+         "Junior template logic.",
+)
+
+st.markdown("<hr>", unsafe_allow_html=True)
+
 # ─── Instructions ────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="step"><div class="step-num">1</div><div class="step-text">Upload your <b>Root PPTX</b> — this is the file with all your content (text, tables, images).</div></div>
-<div class="step"><div class="step-num">2</div><div class="step-text">Upload your <b>Template PPTX</b> — this is the file with the design, theme & slide layouts you want to use.</div></div>
-<div class="step"><div class="step-num">3</div><div class="step-text">Click <b>Merge Slides</b> and download your perfectly styled presentation!</div></div>
+st.markdown(f"""
+<div class="step"><div class="step-num">1</div><div class="step-text">Upload your <b>{program} Root PPTX</b> — the file with all your content (text, tables, images).</div></div>
+<div class="step"><div class="step-num">2</div><div class="step-text">Upload your <b>{program} Template PPTX</b> — the file with the design, theme & slide layouts you want to use.</div></div>
+<div class="step"><div class="step-num">3</div><div class="step-text">Click <b>Merge Slides</b> to apply the <b>{program}</b> merge rules and download your styled presentation!</div></div>
 """, unsafe_allow_html=True)
 
 st.markdown("<hr>", unsafe_allow_html=True)
@@ -195,12 +213,13 @@ with col2:
 st.markdown("<hr>", unsafe_allow_html=True)
 
 # ─── Merge button ────────────────────────────────────────────────────────────
-if st.button("✨  Merge Slides", disabled=not (root_file and template_file)):
-    with st.spinner("Merging presentations... this may take a few seconds."):
+if st.button(f"✨  Merge {program} Slides", disabled=not (root_file and template_file)):
+    with st.spinner(f"Merging {program} presentation... this may take a few seconds."):
         try:
             root_bytes     = root_file.read()
             template_bytes = template_file.read()
-            output_bytes, warnings = merge_presentations(root_bytes, template_bytes)
+            merge_func = MERGE_FUNCS[program]
+            output_bytes, warnings = merge_func(root_bytes, template_bytes)
 
             st.session_state["output_bytes"] = output_bytes
             st.session_state["warnings"]     = warnings
