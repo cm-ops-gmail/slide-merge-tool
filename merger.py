@@ -1,343 +1,242 @@
 """
-merger.py — Core PPTX merge logic.
+merger.py — Universal PPTX merge logic.
 
-Takes a root PPTX (content) and a template PPTX (design) as bytes,
-returns a new styled PPTX as bytes.
+Takes a Root PPTX (content) and a Template PPTX (design) as bytes and returns a
+new PPTX where every slide's content from the Root is placed onto the Template's
+design (slide master, layouts, theme, background, slide size).
+
+The engine is content-agnostic: nothing about slide order, fonts, titles or
+badges is hard-coded. Each shape is deep-copied at the XML level so its original
+formatting (fonts, colours, tables, pictures, grouping, effects) is preserved
+losslessly, while the Template supplies the surrounding design.
+
+Layout choice can be automatic (best-match) or fully user-driven via a
+`layout_map` — a list giving, per Root slide, the index of the Template layout
+to use. The UI helpers below expose the template's layouts and a suggested map.
 """
 
+import copy
 import io
+
 from pptx import Presentation
-from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE
-from pptx.enum.text import PP_ALIGN
+from pptx.oxml.ns import qn
+
+# Namespace used by every relationship-id attribute (r:embed, r:link, r:id, ...)
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 
 # ─────────────────────────────────────────────
-# Helpers
+# Layout detection (index-based, so the UI can address layouts by number)
 # ─────────────────────────────────────────────
 
-def _is_background_shape(shape):
-    """Skip large full-width background rectangles."""
-    if shape.shape_type == 1:  # AUTO_SHAPE
-        if shape.left <= 100_000 and shape.width >= 9_000_000:
-            return True
-    return False
+def _blank_layout_index(layouts):
+    """Index of the most 'neutral' layout: one named blank, else the one with
+    the fewest placeholders (adds the least competing design)."""
+    best, best_n = 0, None
+    for i, layout in enumerate(layouts):
+        if layout.name.strip().lower() == "blank":
+            return i
+        n = len(layout.placeholders)
+        if best_n is None or n < best_n:
+            best, best_n = i, n
+    return best
 
 
-def _copy_text_frame(src_tf, dst_tf):
-    """Copy every paragraph & run, normalising font to Noto Sans Bengali."""
-    dst_tf.clear()
-    dst_tf.word_wrap = src_tf.word_wrap
+def _layout_lookup(prs_out):
+    """Return (layouts, name->idx, placeholder_count->idx, blank_idx)."""
+    layouts = list(prs_out.slide_layouts)
+    by_name, by_phcount = {}, {}
+    for i, layout in enumerate(layouts):
+        by_name.setdefault(layout.name.strip().lower(), i)
+        by_phcount.setdefault(len(layout.placeholders), i)
+    return layouts, by_name, by_phcount, _blank_layout_index(layouts)
 
-    for attr in ("margin_left", "margin_right", "margin_top", "margin_bottom"):
+
+def _auto_index(root_slide, by_name, by_phcount, blank_idx):
+    """Best-match Template layout index for a Root slide.
+
+    1. Same layout name (case-insensitive).
+    2. Same placeholder count as the Root slide's own layout.
+    3. The neutral / blank layout.
+    """
+    try:
+        name = root_slide.slide_layout.name.strip().lower()
+        if name in by_name:
+            return by_name[name]
+    except Exception:
+        pass
+    try:
+        n = len(root_slide.slide_layout.placeholders)
+        if n in by_phcount:
+            return by_phcount[n]
+    except Exception:
+        pass
+    return blank_idx
+
+
+# ─────────────────────────────────────────────
+# UI helpers (introspection — no mutation)
+# ─────────────────────────────────────────────
+
+def get_template_layout_names(template_bytes: bytes):
+    """List the Template's layout names, indexed as the UI/`layout_map` expect."""
+    prs = Presentation(io.BytesIO(template_bytes))
+    return [layout.name for layout in prs.slide_layouts]
+
+
+def get_root_slide_previews(root_bytes: bytes):
+    """Short text preview + current layout name for each Root slide."""
+    prs = Presentation(io.BytesIO(root_bytes))
+    previews = []
+    for slide in prs.slides:
+        text = ""
+        for shape in slide.shapes:
+            if shape.has_text_frame and shape.text_frame.text.strip():
+                text = " ".join(shape.text_frame.text.split())[:70]
+                break
         try:
-            setattr(dst_tf, attr, getattr(src_tf, attr))
+            layout_name = slide.slide_layout.name
         except Exception:
-            pass
-
-    for p_idx, src_p in enumerate(src_tf.paragraphs):
-        dst_p = dst_tf.paragraphs[0] if p_idx == 0 else dst_tf.add_paragraph()
-
-        try:
-            dst_p.alignment = src_p.alignment
-        except Exception:
-            pass
-        for attr in ("space_after", "space_before", "line_spacing", "level"):
-            try:
-                setattr(dst_p, attr, getattr(src_p, attr))
-            except Exception:
-                pass
-
-        for src_run in src_p.runs:
-            dst_run = dst_p.add_run()
-            dst_run.text = src_run.text
-            f = dst_run.font
-            f.name = "Noto Sans Bengali"
-            if src_run.font.size:
-                f.size = src_run.font.size
-            f.bold      = src_run.font.bold
-            f.italic    = src_run.font.italic
-            f.underline = src_run.font.underline
-            try:
-                if src_run.font.color and src_run.font.color.type == 1:
-                    f.color.rgb = src_run.font.color.rgb
-            except Exception:
-                pass
+            layout_name = ""
+        previews.append({"text": text or "(no text)", "layout": layout_name})
+    return previews
 
 
-def _add_reading_tag(slide):
-    """Grey badge + red 'Reading' label in the top-left of every content slide."""
-    try:
-        box = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 457_200, 514_350, 1_554_480, 347_472)
-        box.fill.solid()
-        box.fill.fore_color.rgb = RGBColor(0xD8, 0xD8, 0xD8)
-        box.line.fill.background()
-    except Exception:
-        pass
-
-    try:
-        tb = slide.shapes.add_textbox(533_400, 529_469, 1_449_177, 347_472)
-        tf = tb.text_frame
-        tf.clear()
-        tf.word_wrap = True
-        run = tf.paragraphs[0].add_run()
-        run.text = "Reading"
-        run.font.name = "Noto Sans Bengali"
-        run.font.size = 228_600
-        run.font.bold = True
-        run.font.color.rgb = RGBColor(0xC3, 0x23, 0x26)
-    except Exception:
-        pass
+def suggest_layout_map(root_bytes: bytes, template_bytes: bytes):
+    """Auto-matched Template layout index for every Root slide (UI defaults)."""
+    prs_root = Presentation(io.BytesIO(root_bytes))
+    prs_out = Presentation(io.BytesIO(template_bytes))
+    _, by_name, by_phcount, blank_idx = _layout_lookup(prs_out)
+    return [_auto_index(s, by_name, by_phcount, blank_idx) for s in prs_root.slides]
 
 
-def _add_title_header(slide, title_tf):
-    """Styled slide title + red divider line for standard content slides."""
-    try:
-        title_box = slide.shapes.add_textbox(457_200, 960_120, 8_229_600, 411_480)
-        _copy_text_frame(title_tf, title_box.text_frame)
-        p = title_box.text_frame.paragraphs[0]
-        p.alignment = PP_ALIGN.LEFT
-        for run in p.runs:
-            run.font.name = "Noto Sans Bengali"
-            run.font.size = 304_800
-            run.font.bold = True
-            run.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
-    except Exception:
-        pass
+# ─────────────────────────────────────────────
+# Lossless shape copying
+# ─────────────────────────────────────────────
 
-    try:
-        line = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 457_200, 1_385_316, 8_229_600, 22_860)
-        line.fill.solid()
-        line.fill.fore_color.rgb = RGBColor(0xFF, 0x00, 0x00)
-        line.line.fill.background()
-    except Exception:
-        pass
-
-
-def _copy_table(new_slide, src_shape, left, top, width, height):
-    rows = len(src_shape.table.rows)
-    cols = len(src_shape.table.columns)
-    new_tbl_shape = new_slide.shapes.add_table(rows, cols, left, top, width, height)
-    new_tbl = new_tbl_shape.table
-
-    # Column / row sizes
-    for ci, col in enumerate(src_shape.table.columns):
-        new_tbl.columns[ci].width = col.width
-    for ri, row in enumerate(src_shape.table.rows):
-        new_tbl.rows[ri].height = row.height
-
-    # Merges first
-    for ri in range(rows):
-        for ci in range(cols):
-            src_cell = src_shape.table.cell(ri, ci)
-            if src_cell.is_merge_origin and (src_cell.span_height > 1 or src_cell.span_width > 1):
-                tr = ri + src_cell.span_height - 1
-                tc = ci + src_cell.span_width - 1
-                new_tbl.cell(ri, ci).merge(new_tbl.cell(tr, tc))
-
-    # Content
-    for ri in range(rows):
-        for ci in range(cols):
-            src_cell = src_shape.table.cell(ri, ci)
-            if not src_cell.is_spanned or src_cell.is_merge_origin:
-                dst_cell = new_tbl.cell(ri, ci)
-                _copy_text_frame(src_cell.text_frame, dst_cell.text_frame)
-                try:
-                    if src_cell.fill.type == 1:
-                        dst_cell.fill.solid()
-                        dst_cell.fill.fore_color.rgb = src_cell.fill.fore_color.rgb
-                except Exception:
-                    pass
+def _remap_relationships(src_part, dst_part, new_el):
+    """Any cloned shape may reference images/media/hyperlinks by relationship id.
+    Those ids are local to the source slide part, so recreate each relationship
+    on the destination part and rewrite the id in the copied XML."""
+    cache = {}
+    for el in new_el.iter():
+        for attr in list(el.attrib):
+            if not attr.startswith("{%s}" % _R_NS):
+                continue
+            old_rid = el.get(attr)
+            if not old_rid or old_rid not in src_part.rels:
+                continue
+            if old_rid not in cache:
+                rel = src_part.rels[old_rid]
+                if rel.is_external:
+                    cache[old_rid] = dst_part.relate_to(
+                        rel.target_ref, rel.reltype, is_external=True
+                    )
+                else:
+                    cache[old_rid] = dst_part.relate_to(rel.target_part, rel.reltype)
+            el.set(attr, cache[old_rid])
 
 
-def _copy_shape(new_slide, shape, left, top, width, height):
-    """Recreate a non-table, non-image shape."""
-    if shape.shape_type in (17, 14):   # TEXT_BOX / PLACEHOLDER
-        new_shape = new_slide.shapes.add_textbox(left, top, width, height)
+def _insert_shape(dst_slide, new_el):
+    """Append a cloned shape element into the slide's shape tree, keeping it
+    before any trailing <p:extLst> so the file stays schema-valid."""
+    spTree = dst_slide.shapes._spTree
+    extLst = spTree.find(qn("p:extLst"))
+    if extLst is not None:
+        extLst.addprevious(new_el)
     else:
+        spTree.append(new_el)
+
+
+def _scale_shape(src_shape, dst_shape, sx, sy):
+    """When Root and Template slide sizes differ, rescale a top-level shape so it
+    still fits the Template's coordinate space."""
+    for attr, factor in (("left", sx), ("top", sy), ("width", sx), ("height", sy)):
         try:
-            new_shape = new_slide.shapes.add_shape(shape.shape_type, left, top, width, height)
+            v = getattr(src_shape, attr)
+            if v is not None:
+                setattr(dst_shape, attr, int(round(v * factor)))
         except Exception:
-            new_shape = new_slide.shapes.add_textbox(left, top, width, height)
+            pass
 
-    if shape.has_text_frame:
-        _copy_text_frame(shape.text_frame, new_shape.text_frame)
 
-    try:
-        if shape.fill.type == 1:
-            new_shape.fill.solid()
-            new_shape.fill.fore_color.rgb = shape.fill.fore_color.rgb
-        elif shape.fill.type == 5:
-            new_shape.fill.background()
-    except Exception:
-        pass
-
-    try:
-        if shape.line.color and shape.line.color.type == 1:
-            new_shape.line.color.rgb = shape.line.color.rgb
-        if shape.line.width:
-            new_shape.line.width = shape.line.width
-    except Exception:
-        pass
-
-    try:
-        new_shape.rotation = shape.rotation
-    except Exception:
-        pass
-
-    return new_shape
+def _reassign_shape_ids(dst_slide):
+    """Give every shape a unique cNvPr id within the slide (cloning can duplicate
+    ids, which makes PowerPoint prompt to 'repair')."""
+    idx = 1
+    for cNvPr in dst_slide.shapes._spTree.iter(qn("p:cNvPr")):
+        cNvPr.set("id", str(idx))
+        idx += 1
 
 
 # ─────────────────────────────────────────────
 # Main entry point
 # ─────────────────────────────────────────────
 
-def merge_presentations(root_bytes: bytes, template_bytes: bytes) -> bytes:
+def merge_presentations(root_bytes: bytes, template_bytes: bytes, layout_map=None):
     """
-    Merge root content into template design.
+    Apply the Template's design to the Root's content.
 
     Parameters
     ----------
-    root_bytes     : bytes of the Root PPTX file
-    template_bytes : bytes of the Template PPTX file
+    root_bytes     : bytes of the Root PPTX (content source)
+    template_bytes : bytes of the Template PPTX (design source)
+    layout_map     : optional list — layout_map[i] is the Template layout index
+                     for Root slide i. Entries that are None (or out of range),
+                     and slides beyond the list, fall back to auto-matching.
+                     Pass None to auto-match every slide.
 
     Returns
     -------
-    bytes of the new styled PPTX
+    (bytes of the new PPTX, list[str] of non-fatal warnings)
     """
-    prs_root     = Presentation(io.BytesIO(root_bytes))
-    prs_styled   = Presentation(io.BytesIO(template_bytes))
+    prs_root = Presentation(io.BytesIO(root_bytes))
+    prs_out = Presentation(io.BytesIO(template_bytes))
 
-    # ── Wipe all slides in the styled copy ──────────────────────────────────
-    sldIdLst = prs_styled.slides._sldIdLst
-    while len(sldIdLst):
-        prs_styled.part.drop_rel(sldIdLst[0].rId)
-        del sldIdLst[0]
+    # Keep the Template's slide size; scale Root content if the sizes differ.
+    tw, th = prs_out.slide_width, prs_out.slide_height
+    rw, rh = prs_root.slide_width, prs_root.slide_height
+    sx = (tw / rw) if rw else 1.0
+    sy = (th / rh) if rh else 1.0
+    need_scale = abs(sx - 1) > 0.01 or abs(sy - 1) > 0.01
 
-    layouts = prs_styled.slide_layouts
-    # Layout index: 0=BLANK 1=TITLE 2=2_Blank 3=1_Blank 4=3_Blank 5=4_Blank 6=1_IELTS
+    # ── Wipe the Template's own slides (we only want its design) ────────────────
+    sldIdLst = prs_out.slides._sldIdLst
+    for sldId in list(sldIdLst):
+        prs_out.part.drop_rel(sldId.rId)
+        sldIdLst.remove(sldId)
+
+    layouts, by_name, by_phcount, blank_idx = _layout_lookup(prs_out)
 
     warnings = []
 
     for slide_idx, root_slide in enumerate(prs_root.slides):
-
-        # ── 1. Pick layout ────────────────────────────────────────────────────
-        if slide_idx in (0, 5, 32):
-            layout = layouts[1]          # TITLE
-        elif (6 <= slide_idx <= 29) or (33 <= slide_idx <= 36):
-            layout = layouts[4]          # 3_Blank  (passage / question slides)
+        # ── Pick the Template layout ──────────────────────────────────────────
+        chosen = None
+        if layout_map is not None and slide_idx < len(layout_map):
+            chosen = layout_map[slide_idx]
+        if isinstance(chosen, int) and 0 <= chosen < len(layouts):
+            layout = layouts[chosen]
         else:
-            layout = layouts[2]          # 2_Blank  (standard content)
+            layout = layouts[_auto_index(root_slide, by_name, by_phcount, blank_idx)]
 
-        new_slide = prs_styled.slides.add_slide(layout)
+        new_slide = prs_out.slides.add_slide(layout)
 
-        # ── 2. Cover slide ────────────────────────────────────────────────────
-        if slide_idx == 0:
-            tb = new_slide.shapes.add_textbox(1_828_800, 952_189, 5_486_400, 1_619_561)
-            tf = tb.text_frame
-            tf.clear()
-            tf.word_wrap = True
-
-            data = [
-                ("Class - 09",          508_000, RGBColor(0x33,0x33,0x33)),
-                ("Tables and Diagrams", 508_000, RGBColor(0x33,0x33,0x33)),
-                ("Reading",             304_800, RGBColor(0xC3,0x23,0x26)),
-            ]
-            for i, (text, size, color) in enumerate(data):
-                p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                p.alignment = PP_ALIGN.CENTER
-                run = p.add_run()
-                run.text = text
-                run.font.name  = "Noto Sans Bengali"
-                run.font.size  = size
-                run.font.bold  = True
-                run.font.color.rgb = color
-            continue
-
-        # ── 3. Section-break slides ───────────────────────────────────────────
-        if slide_idx in (5, 32):
-            txt = "Guided Practice Questions"
-            for s in root_slide.shapes:
-                if s.has_text_frame and s.text_frame.text.strip() and s.left > 100_000:
-                    txt = s.text_frame.text.strip()
-                    break
-
-            tb = new_slide.shapes.add_textbox(1_828_800, 1_500_000, 5_486_400, 1_619_561)
-            tf = tb.text_frame
-            tf.clear()
-            tf.word_wrap = True
-            p = tf.paragraphs[0]
-            p.alignment = PP_ALIGN.CENTER
-            run = p.add_run()
-            run.text = txt
-            run.font.name  = "Noto Sans Bengali"
-            run.font.size  = 406_400
-            run.font.bold  = True
-            run.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
-            continue
-
-        # ── 4. All other slides ───────────────────────────────────────────────
-        _add_reading_tag(new_slide)
-
-        is_passage = (6 <= slide_idx <= 29) or (33 <= slide_idx <= 36)
-
-        # Find title shape (topmost short text on non-passage slides)
-        title_shape = None
-        if not is_passage:
-            candidates = [
-                s for s in root_slide.shapes
-                if s.has_text_frame
-                and s.text_frame.text.strip()
-                and not _is_background_shape(s)
-            ]
-            candidates.sort(key=lambda s: s.top)
-            if candidates:
-                c = candidates[0]
-                if c.top < 1_000_000 and len(c.text_frame.text.strip()) < 50:
-                    title_shape = c
-
-        if title_shape:
-            _add_title_header(new_slide, title_shape.text_frame)
-
-        # Copy all remaining shapes
+        # ── Copy every shape losslessly ───────────────────────────────────────
         for shape in root_slide.shapes:
-            if _is_background_shape(shape):
-                continue
-            if title_shape and shape == title_shape:
-                continue
-
-            left, top, width, height = shape.left, shape.top, shape.width, shape.height
-
-            # Shift overlapping elements down
-            if is_passage:
-                if left < 3_000_000 and top < 960_120:
-                    shift = 960_120 - top
-                    top    = 960_120
-                    height = max(100_000, height - shift)
-            else:
-                if top < 1_500_000:
-                    shift = 1_500_000 - top
-                    top    = 1_500_000
-                    height = max(100_000, height - shift)
-
             try:
-                if shape.shape_type == 13:          # PICTURE
-                    stream = io.BytesIO(shape.image.blob)
-                    img = new_slide.shapes.add_picture(stream, left, top, width, height)
-                    try:
-                        img.rotation = shape.rotation
-                    except Exception:
-                        pass
-
-                elif shape.shape_type == 19:        # TABLE
-                    _copy_table(new_slide, shape, left, top, width, height)
-
-                else:
-                    _copy_shape(new_slide, shape, left, top, width, height)
-
+                new_el = copy.deepcopy(shape._element)
+                _remap_relationships(root_slide.part, new_slide.part, new_el)
+                _insert_shape(new_slide, new_el)
+                if need_scale:
+                    _scale_shape(shape, new_slide.shapes[-1], sx, sy)
             except Exception as e:
-                warnings.append(f"Slide {slide_idx+1} | shape '{shape.name}': {e}")
+                warnings.append(
+                    f"Slide {slide_idx + 1} | shape '{getattr(shape, 'name', '?')}': {e}"
+                )
+
+        _reassign_shape_ids(new_slide)
 
     out = io.BytesIO()
-    prs_styled.save(out)
+    prs_out.save(out)
     return out.getvalue(), warnings
